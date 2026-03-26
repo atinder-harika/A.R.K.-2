@@ -6,6 +6,7 @@ fastapi backend for ark prototype.
 
 1. install python deps in `server/requirements.txt`
 2. set `GEMINI_API_KEY` in `server/.env`
+	- optional: set `GEMINI_MODEL` to force a model name
 3. make sure blender cli is available in `PATH` or set `BLENDER_PATH`
 4. run server:
 
@@ -17,6 +18,10 @@ python main.py
 ## health check
 
 `GET /health` returns runtime status including blender availability and last generation result.
+
+health also returns `gemini_model` so you can see what model is active.
+
+`GET /api/blender-check` returns blender path + version check result.
 
 ## generate obj with rest
 
@@ -37,6 +42,8 @@ success response includes:
 - `obj_path` (relative path like `generated/objs/...`)
 - `script_path` (saved generated blender script)
 - `status` set to `success`
+
+if blender is not available, status becomes `script_ready` and you still get `script_path` so you can inspect or run it later.
 
 notes:
 
@@ -61,6 +68,7 @@ send:
 events:
 
 - `generation_started`
+- `generation_script_ready` (when blender is missing)
 - `generation_complete` or `generation_failed`
 - `generate_result` (final payload wrapper)
 
