@@ -46,7 +46,7 @@ python main.py
 Set in [server/.env](server/.env):
 
 - `LOCAL_CODER_URL` (default: `http://localhost:11434/api/generate`)
-- `LOCAL_CODER_MODEL` (default: `qwen2.5-coder`)
+- `LOCAL_CODER_MODEL` (default: `qwen2.5-coder:7b`)
 - `BLENDER_PATH` (optional if Blender is in PATH)
 - `ARK_WAKE_PHRASE` (optional, default `hello ark`)
 

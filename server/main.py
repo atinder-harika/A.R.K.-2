@@ -25,7 +25,7 @@ ENV_PATH = Path(__file__).resolve().parent / ".env"
 load_dotenv(dotenv_path=ENV_PATH)
 
 LOCAL_CODER_URL = os.getenv("LOCAL_CODER_URL", "http://localhost:11434/api/generate")
-LOCAL_CODER_MODEL = os.getenv("LOCAL_CODER_MODEL", "qwen2.5-coder")
+LOCAL_CODER_MODEL = os.getenv("LOCAL_CODER_MODEL", "qwen2.5-coder:7b")
 
 ARK_COMMAND_SYSTEM_PROMPT = (
     "You are A.R.K., an Augmented Reality Kinetic Interface assistant. "
