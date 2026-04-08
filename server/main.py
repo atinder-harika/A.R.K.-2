@@ -20,7 +20,6 @@ from fastapi.middleware.cors import CORSMiddleware
 from dotenv import load_dotenv
 from voice_service import VoiceCommandService
 from image_to_3d_service import ImageTo3DService
-from webcam_jobs import WebcamJobService
 
 ENV_PATH = Path(__file__).resolve().parent / ".env"
 load_dotenv(dotenv_path=ENV_PATH)
@@ -83,7 +82,6 @@ last_generation_status = {
 blender_path = ""
 generation_last_seen: dict[str, float] = {}
 voice_service: VoiceCommandService | None = None
-webcam_job_service: WebcamJobService | None = None
 image_to_3d_service: ImageTo3DService | None = None
 
 
@@ -561,7 +559,7 @@ async def generate_obj_from_prompt(
 
 @app.on_event("startup")
 async def startup_event():
-    global blender_path, voice_service, webcam_job_service, image_to_3d_service
+    global blender_path, voice_service, image_to_3d_service
     ensure_generated_dirs()
     blender_path = resolve_blender_path()
 
@@ -571,12 +569,6 @@ async def startup_event():
         notify_fn=lambda payload: broadcast_unity_event(payload),
         intent_fn=lambda text: query_voice_intent(text),
         wake_phrase=os.getenv("ARK_WAKE_PHRASE", "hello ark"),
-    )
-
-    webcam_job_service = WebcamJobService(
-        generated_dir=GENERATED_DIR,
-        generate_fn=lambda prompt, filename: generate_obj_from_prompt(prompt, filename, source="webcam"),
-        notify_fn=lambda payload: broadcast_unity_event(payload),
     )
 
     image_to_3d_service = ImageTo3DService(
@@ -755,41 +747,6 @@ async def voice_stop():
     if not ok:
         raise HTTPException(status_code=500, detail=message)
     return {"status": "ok", "message": message, "voice": voice_service.status()}
-
-
-@app.post("/api/webcam/jobs")
-async def create_webcam_job(body: dict):
-    if not webcam_job_service:
-        raise HTTPException(status_code=500, detail="webcam job service unavailable")
-
-    prompt = str(body.get("prompt", "")).strip()
-    filename_hint = str(body.get("filename", "webcam-model")).strip()
-    frames = body.get("frames", [])
-    if not isinstance(frames, list):
-        raise HTTPException(status_code=400, detail="frames must be a list of base64 strings")
-    if len(frames) < 2:
-        raise HTTPException(status_code=400, detail="at least 2 frames are required")
-
-    prompt_for_generation = prompt if prompt else "reconstruct the object from captured webcam angles"
-    job = await webcam_job_service.create_job(prompt_for_generation, frames, filename_hint)
-    return {"status": "accepted", "job": job}
-
-
-@app.get("/api/webcam/jobs")
-async def list_webcam_jobs():
-    if not webcam_job_service:
-        raise HTTPException(status_code=500, detail="webcam job service unavailable")
-    return {"jobs": await webcam_job_service.list_jobs()}
-
-
-@app.get("/api/webcam/jobs/{job_id}")
-async def get_webcam_job(job_id: str):
-    if not webcam_job_service:
-        raise HTTPException(status_code=500, detail="webcam job service unavailable")
-    job = await webcam_job_service.get_job(job_id)
-    if not job:
-        raise HTTPException(status_code=404, detail="job not found")
-    return {"job": job}
 
 
 # --- WebSocket for Unity Communication ---

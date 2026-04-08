@@ -1,82 +1,91 @@
 # A.R.K.-2
 
-fastapi backend for ark prototype.
+Local-first FastAPI backend for the A.R.K. capstone prototype.
 
-## quick start
+## Source Of Truth
 
-1. install python deps in `server/requirements.txt`
-2. set `GEMINI_API_KEY` in `server/.env`
-	- optional: set `GEMINI_MODEL` to force a model name
-3. make sure blender cli is available in `PATH` or set `BLENDER_PATH`
-4. run server:
+All execution rules and migration phases are centralized in:
+
+- [Agents/Master_Execution_Prompt.txt](Agents/Master_Execution_Prompt.txt)
+
+## Current Scope
+
+Implemented now:
+
+- Local LLM command and Blender script generation through Ollama Qwen2.5-Coder
+- Local image-to-3D flow through TripoSR CLI hook
+- Voice intent routing for `generate_blender` and `edit_unity`
+- WebSocket broadcast to Unity clients
+- Health smoke testing
+
+Deferred for later:
+
+- Webcam job pipeline
+
+## Quick Start
+
+1. Create and activate a Python virtual environment.
+2. Install dependencies:
+
+```bash
+cd server
+pip install -r requirements.txt
+```
+
+3. Ensure Ollama is running and has the configured model.
+4. Ensure Blender CLI is installed and accessible.
+5. Start API server:
 
 ```bash
 cd server
 python main.py
 ```
 
-## health check
+## Key Environment Variables
 
-`GET /health` returns runtime status including blender availability and last generation result.
+Set in [server/.env](server/.env):
 
-health also returns `gemini_model` so you can see what model is active.
+- `LOCAL_CODER_URL` (default: `http://localhost:11434/api/generate`)
+- `LOCAL_CODER_MODEL` (default: `qwen2.5-coder`)
+- `BLENDER_PATH` (optional if Blender is in PATH)
+- `ARK_WAKE_PHRASE` (optional, default `hello ark`)
 
-`GET /api/blender-check` returns blender path + version check result.
+## API Endpoints
 
-## generate obj with rest
+Core:
 
-endpoint: `POST /api/generate-obj`
+- `GET /health`
+- `GET /api/blender-check`
+- `POST /api/command`
+- `POST /api/generate-obj`
+- `GET /api/generation-jobs`
 
-request body:
+Image-to-3D:
 
-```json
-{
-	"prompt": "make a simple tennis racket handle grip with small grooves",
-	"filename": "racket-grip"
-}
+- `POST /api/image-to-3d`
+- `GET /api/image-to-3d/jobs`
+- `GET /api/image-to-3d/jobs/{job_id}`
+- `GET /api/image-to-3d/provider-check`
+
+Voice:
+
+- `GET /api/voice/status`
+- `POST /api/voice/start`
+- `POST /api/voice/stop`
+
+WebSocket:
+
+- `WS /ws`
+
+## Run Tests
+
+From repo root:
+
+```bash
+.\.venv\Scripts\python.exe -m unittest discover -s server/tests -p "test_*.py"
 ```
 
-success response includes:
+## Notes
 
-- `job_id`
-- `obj_path` (relative path like `generated/objs/...`)
-- `script_path` (saved generated blender script)
-- `status` set to `success`
-
-if blender is not available, status becomes `script_ready` and you still get `script_path` so you can inspect or run it later.
-
-notes:
-
-- prompt max length is 300 chars
-- generation has a short cooldown (429 if called too fast)
-- some blocked tokens are rejected for safety
-
-## generate obj with websocket
-
-connect to `ws://localhost:8000/ws`
-
-send:
-
-```json
-{
-	"type": "generate",
-	"prompt": "make a low poly gear",
-	"filename": "gear"
-}
-```
-
-events:
-
-- `generation_started`
-- `generation_script_ready` (when blender is missing)
-- `generation_complete` or `generation_failed`
-- `generate_result` (final payload wrapper)
-
-## generated files
-
-- scripts: `server/generated/scripts`
-- objs: `server/generated/objs`
-
-## debug endpoints
-
-- `GET /api/generation-jobs` returns recent generation jobs (in-memory history)
+- Generated runtime artifacts are written under [server/generated](server/generated).
+- Meshes must remain modular; do not join objects during generation.
