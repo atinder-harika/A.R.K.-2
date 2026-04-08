@@ -9,25 +9,26 @@ import re
 import shutil
 import uuid
 import asyncio
+import sys
+import requests
 from collections import deque
 from datetime import datetime, timezone
 from pathlib import Path
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
-from fastapi import HTTPException
+from fastapi import HTTPException, File, Form, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from dotenv import load_dotenv
-import google.generativeai as genai
+from voice_service import VoiceCommandService
+from image_to_3d_service import ImageTo3DService
+from webcam_jobs import WebcamJobService
 
-load_dotenv()
+ENV_PATH = Path(__file__).resolve().parent / ".env"
+load_dotenv(dotenv_path=ENV_PATH)
 
-# --- Gemini Setup ---
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
-genai.configure(api_key=GEMINI_API_KEY)
-GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-1.5-flash")
-model = None
-active_model_name = ""
+LOCAL_CODER_URL = os.getenv("LOCAL_CODER_URL", "http://localhost:11434/api/generate")
+LOCAL_CODER_MODEL = os.getenv("LOCAL_CODER_MODEL", "qwen2.5-coder")
 
-ARK_SYSTEM_PROMPT = (
+ARK_COMMAND_SYSTEM_PROMPT = (
     "You are A.R.K., an Augmented Reality Kinetic Interface assistant. "
     "You help users manipulate 3D models through natural language. "
     "When a user gives a command, respond with a short JSON object containing: "
@@ -35,6 +36,14 @@ ARK_SYSTEM_PROMPT = (
     '"params" (a dict of parameters like axis, value, color hex, etc.), '
     'and "description" (a short human-readable summary of what you did). '
     "Keep responses concise. If the command is conversational, set action to info."
+)
+
+BLENDER_SCRIPT_SYSTEM_PROMPT = (
+    "You are an expert Python Blender Developer. "
+    "Write a script to generate the requested 3D model. "
+    "CRITICAL: Do NOT join meshes (bpy.ops.object.join()). "
+    "Keep distinct parts as separate objects in the hierarchy. "
+    "Ensure the script exports an OBJ."
 )
 
 app = FastAPI(title="A.R.K. Server", version="0.1.0")
@@ -73,6 +82,9 @@ last_generation_status = {
 
 blender_path = ""
 generation_last_seen: dict[str, float] = {}
+voice_service: VoiceCommandService | None = None
+webcam_job_service: WebcamJobService | None = None
+image_to_3d_service: ImageTo3DService | None = None
 
 
 def now_iso() -> str:
@@ -113,53 +125,16 @@ def resolve_blender_path() -> str:
     return ""
 
 
-def select_gemini_model_name() -> str:
-    if GEMINI_MODEL:
-        return GEMINI_MODEL
-
+def query_local_coder(prompt: str) -> str:
+    """Queries the local Ollama instance running Qwen2.5-Coder."""
+    payload = {"model": LOCAL_CODER_MODEL, "prompt": prompt, "stream": False}
     try:
-        for item in genai.list_models():
-            methods = getattr(item, "supported_generation_methods", []) or []
-            if "generateContent" in methods:
-                name = getattr(item, "name", "")
-                if name.startswith("models/"):
-                    return name.replace("models/", "", 1)
-                return name
-    except Exception:
-        return ""
-
-    return ""
-
-
-def initialize_gemini_model() -> None:
-    global model, active_model_name
-    selected = select_gemini_model_name()
-    active_model_name = selected
-    model = genai.GenerativeModel(selected) if selected else None
-
-
-def refresh_model_if_missing(error_text: str) -> bool:
-    global model, active_model_name
-    lower_error = error_text.lower()
-    if "not found" not in lower_error and "unsupported" not in lower_error:
-        return False
-
-    try:
-        for item in genai.list_models():
-            methods = getattr(item, "supported_generation_methods", []) or []
-            if "generateContent" not in methods:
-                continue
-            name = getattr(item, "name", "")
-            candidate = name.replace("models/", "", 1) if name.startswith("models/") else name
-            if not candidate or candidate == active_model_name:
-                continue
-            active_model_name = candidate
-            model = genai.GenerativeModel(candidate)
-            return True
-    except Exception:
-        return False
-
-    return False
+        response = requests.post(LOCAL_CODER_URL, json=payload, timeout=60)
+        response.raise_for_status()
+        return response.json().get("response", "")
+    except Exception as e:
+        print(f"Local LLM Error: {e}")
+        return "{}"
 
 
 def to_relative_artifact_path(path: Path) -> str:
@@ -276,64 +251,54 @@ def enforce_generate_cooldown(client_key: str) -> tuple[bool, int]:
     return True, 0
 
 
-async def ask_gemini(prompt: str) -> dict:
-    """Send a prompt to Gemini and parse the JSON action response."""
+async def query_local_command(prompt: str) -> dict:
+    """Send a prompt to local coder and parse the JSON action response."""
     try:
-        if not model:
-            return {"action": "error", "params": {}, "description": "no gemini model is configured"}
-
-        full_prompt = f"{ARK_SYSTEM_PROMPT}\n\nUser command: {prompt}\n\nRespond with ONLY valid JSON."
-        try:
-            response = model.generate_content(full_prompt)
-        except Exception as first_error:
-            if refresh_model_if_missing(str(first_error)) and model:
-                response = model.generate_content(full_prompt)
-            else:
-                raise
-
-        text = response.text.strip()
+        full_prompt = f"{ARK_COMMAND_SYSTEM_PROMPT}\n\nUser command: {prompt}\n\nRespond with ONLY valid JSON."
+        text = await asyncio.to_thread(query_local_coder, full_prompt)
+        text = text.strip()
         # Strip markdown code fences if present
         if text.startswith("```"):
             text = text.split("\n", 1)[1]
             text = text.rsplit("```", 1)[0].strip()
         return json.loads(text)
     except json.JSONDecodeError:
-        return {"action": "info", "params": {}, "description": response.text.strip()}
+        return {"action": "info", "params": {}, "description": text}
     except Exception as e:
         return {"action": "error", "params": {}, "description": str(e)}
 
 
-async def ask_gemini_blender_script(user_prompt: str, obj_output_path: Path) -> str:
-    if not model:
-        raise ValueError("no gemini model is configured")
-
+async def query_local_blender_script(user_prompt: str, obj_output_path: Path) -> str:
     prompt = (
-        "you write safe blender python scripts for blender headless mode. "
-        "output only python code with no markdown and no explanation. "
-        "constraints: use bpy only, clear default scene objects, build geometry that matches the request, "
-        "set basic transforms if needed. do not call any export operator directly. "
-        "just build geometry. export is handled by the server wrapper. "
-        "do not import os/sys/socket/subprocess/requests. do not read or write any files except this obj export. "
-        "output path: "
-        f"{obj_output_path.as_posix()}\n"
-        f"user request: {user_prompt}\n"
+        f"{BLENDER_SCRIPT_SYSTEM_PROMPT}\n"
+        "Output only Python code with no markdown and no explanation.\n"
+        "Use bpy only. Clear default scene objects, build geometry that matches the request, and keep parts modular.\n"
+        "Do not import os/sys/socket/subprocess/requests.\n"
+        f"Output path: {obj_output_path.as_posix()}\n"
+        f"User request: {user_prompt}\n"
     )
 
-    try:
-        response = model.generate_content(prompt)
-    except Exception as first_error:
-        if refresh_model_if_missing(str(first_error)) and model:
-            response = model.generate_content(prompt)
-        else:
-            raise
-
-    script_text = strip_code_fence(response.text)
+    raw_text = await asyncio.to_thread(query_local_coder, prompt)
+    script_text = strip_code_fence(raw_text)
     script_text = normalize_obj_export(script_text)
     script_text = script_text.replace("{OBJ_PATH}", obj_output_path.as_posix())
     is_valid, reason = validate_blender_script(script_text)
     if not is_valid:
         raise ValueError(reason)
     return script_text
+
+
+async def query_voice_intent(text: str) -> dict:
+    prompt = (
+        f"Analyze this user command: '{text}'. Return ONLY valid JSON. "
+        "If making a new 3D model, return {\"intent\": \"generate_blender\", \"prompt\": \"<command>\"}. "
+        "If modifying color/material of an existing part, return {\"intent\": \"edit_unity\", \"target\": \"<part_name>\", \"color\": \"<color_name>\"}."
+    )
+    raw = await asyncio.to_thread(query_local_coder, prompt)
+    try:
+        return json.loads(strip_code_fence(raw))
+    except Exception:
+        return {"intent": "generate_blender", "prompt": text}
 
 
 async def run_blender_script(script_path: Path) -> tuple[bool, int, str, str, str]:
@@ -405,7 +370,53 @@ async def send_generation_event(ws: WebSocket | None, payload: dict) -> None:
     await ws.send_json(payload)
 
 
-async def generate_obj_from_prompt(user_prompt: str, filename_hint: str, ws: WebSocket | None = None) -> dict:
+async def broadcast_unity_event(payload: dict, skip_ws: WebSocket | None = None) -> None:
+    stale_clients: list[WebSocket] = []
+    for client in connected_clients.copy():
+        if skip_ws and client is skip_ws:
+            continue
+        try:
+            await client.send_json(payload)
+        except Exception:
+            stale_clients.append(client)
+
+    for client in stale_clients:
+        if client in connected_clients:
+            connected_clients.remove(client)
+
+
+def validate_generate_request(prompt: str, client_key: str) -> tuple[bool, str]:
+    if not prompt:
+        return False, "prompt is required"
+    if len(prompt) > MAX_PROMPT_LEN:
+        return False, f"prompt must be <= {MAX_PROMPT_LEN} chars"
+    blocked, token = contains_blocked_prompt_text(prompt)
+    if blocked:
+        return False, f"prompt contains blocked token: {token}"
+
+    allowed, wait_seconds = enforce_generate_cooldown(client_key)
+    if not allowed:
+        return False, f"wait {wait_seconds}s before generating again"
+
+    return True, ""
+
+
+async def process_command_text(command_text: str) -> dict:
+    result = await query_local_command(command_text)
+    return {
+        "command": command_text,
+        "action": result.get("action", "info"),
+        "params": result.get("params", {}),
+        "description": result.get("description", ""),
+    }
+
+
+async def generate_obj_from_prompt(
+    user_prompt: str,
+    filename_hint: str,
+    ws: WebSocket | None = None,
+    source: str = "api",
+) -> dict:
     global last_generation_status
 
     job_id = uuid.uuid4().hex[:10]
@@ -418,10 +429,19 @@ async def generate_obj_from_prompt(user_prompt: str, filename_hint: str, ws: Web
         "type": "generation_started",
         "job_id": job_id,
         "prompt": user_prompt,
+        "source": source,
     })
 
+    if not ws:
+        await broadcast_unity_event({
+            "type": "generation_started",
+            "job_id": job_id,
+            "prompt": user_prompt,
+            "source": source,
+        })
+
     try:
-        script_text = await ask_gemini_blender_script(user_prompt, obj_path)
+        script_text = await query_local_blender_script(user_prompt, obj_path)
         script_path.write_text(script_text, encoding="utf-8")
 
         if not blender_path:
@@ -448,7 +468,15 @@ async def generate_obj_from_prompt(user_prompt: str, filename_hint: str, ws: Web
                 "job_id": job_id,
                 "script_path": result["script_path"],
                 "message": result["message"],
+                "source": source,
             })
+            await broadcast_unity_event({
+                "type": "generation_script_ready",
+                "job_id": job_id,
+                "script_path": result["script_path"],
+                "message": result["message"],
+                "source": source,
+            }, skip_ws=ws)
             return result
 
         ok, exit_code, stdout_text, stderr_text, error_message = await run_blender_script(script_path)
@@ -485,7 +513,16 @@ async def generate_obj_from_prompt(user_prompt: str, filename_hint: str, ws: Web
             "obj_path": result["obj_path"],
             "script_path": result["script_path"],
             "message": result["message"],
+            "source": source,
         })
+        await broadcast_unity_event({
+            "type": "generation_complete",
+            "job_id": job_id,
+            "obj_path": result["obj_path"],
+            "script_path": result["script_path"],
+            "message": result["message"],
+            "source": source,
+        }, skip_ws=ws)
         return result
 
     except Exception as e:
@@ -511,16 +548,47 @@ async def generate_obj_from_prompt(user_prompt: str, filename_hint: str, ws: Web
             "type": "generation_failed",
             "job_id": job_id,
             "message": str(e),
+            "source": source,
         })
+        await broadcast_unity_event({
+            "type": "generation_failed",
+            "job_id": job_id,
+            "message": str(e),
+            "source": source,
+        }, skip_ws=ws)
         return result
 
 
 @app.on_event("startup")
 async def startup_event():
-    global blender_path
+    global blender_path, voice_service, webcam_job_service, image_to_3d_service
     ensure_generated_dirs()
     blender_path = resolve_blender_path()
-    initialize_gemini_model()
+
+    voice_service = VoiceCommandService(
+        generate_fn=lambda prompt, filename: generate_obj_from_prompt(prompt, filename, source="voice"),
+        command_fn=lambda command: process_command_text(command),
+        notify_fn=lambda payload: broadcast_unity_event(payload),
+        intent_fn=lambda text: query_voice_intent(text),
+        wake_phrase=os.getenv("ARK_WAKE_PHRASE", "hello ark"),
+    )
+
+    webcam_job_service = WebcamJobService(
+        generated_dir=GENERATED_DIR,
+        generate_fn=lambda prompt, filename: generate_obj_from_prompt(prompt, filename, source="webcam"),
+        notify_fn=lambda payload: broadcast_unity_event(payload),
+    )
+
+    image_to_3d_service = ImageTo3DService(
+        generated_dir=GENERATED_DIR,
+        notify_fn=lambda payload: broadcast_unity_event(payload),
+    )
+
+
+@app.on_event("shutdown")
+async def shutdown_event():
+    if voice_service:
+        voice_service.stop()
 
 
 # --- REST Endpoints ---
@@ -532,15 +600,29 @@ async def root():
 
 @app.get("/health")
 async def health():
+    image_provider = {
+        "configured": False,
+        "mode": "local_triposr_cli",
+        "python_executable": sys.executable,
+    }
+    if image_to_3d_service:
+        image_provider = {
+            "configured": image_to_3d_service.cli_available,
+            "mode": "local_triposr_cli",
+            "python_executable": sys.executable,
+            "output_root": str(image_to_3d_service.obj_dir).replace("\\", "/"),
+        }
+
     return {
         "status": "healthy",
-        "gemini_key_set": bool(GEMINI_API_KEY),
+        "local_coder_url": LOCAL_CODER_URL,
+        "local_coder_model": LOCAL_CODER_MODEL,
         "connected_clients": len(connected_clients),
-        "gemini_model": active_model_name,
         "blender_available": bool(blender_path),
         "blender_path": blender_path,
         "generated_dir": str(GENERATED_DIR),
         "last_generation_status": last_generation_status,
+        "image_to_3d": image_provider,
     }
 
 
@@ -548,7 +630,7 @@ async def health():
 async def rest_command(body: dict):
     """REST endpoint so you can test commands without WebSocket."""
     prompt = body.get("command", "")
-    result = await ask_gemini(prompt)
+    result = await process_command_text(prompt)
     return {"input": prompt, "result": result}
 
 
@@ -557,19 +639,13 @@ async def rest_generate_obj(body: dict):
     prompt = str(body.get("prompt", "")).strip()
     filename_hint = str(body.get("filename", "model")).strip()
 
-    if not prompt:
-        raise HTTPException(status_code=400, detail="prompt is required")
-    if len(prompt) > MAX_PROMPT_LEN:
-        raise HTTPException(status_code=400, detail=f"prompt must be <= {MAX_PROMPT_LEN} chars")
-    blocked, token = contains_blocked_prompt_text(prompt)
-    if blocked:
-        raise HTTPException(status_code=400, detail=f"prompt contains blocked token: {token}")
+    ok, message = validate_generate_request(prompt, "rest")
+    if not ok:
+        if message.startswith("wait "):
+            raise HTTPException(status_code=429, detail=message)
+        raise HTTPException(status_code=400, detail=message)
 
-    allowed, wait_seconds = enforce_generate_cooldown("rest")
-    if not allowed:
-        raise HTTPException(status_code=429, detail=f"wait {wait_seconds}s before generating again")
-
-    result = await generate_obj_from_prompt(prompt, filename_hint)
+    result = await generate_obj_from_prompt(prompt, filename_hint, source="rest")
     if result.get("status") not in ["success", "script_ready"]:
         raise HTTPException(status_code=500, detail=result)
     return result
@@ -583,6 +659,137 @@ async def get_generation_jobs():
 @app.get("/api/blender-check")
 async def blender_check():
     return await check_blender_runtime()
+
+
+@app.post("/api/image-to-3d")
+async def create_image_to_3d_job(
+    prompt: str = Form(...),
+    filename: str = Form("image-model"),
+    image: UploadFile = File(...),
+):
+    if not image_to_3d_service:
+        raise HTTPException(status_code=500, detail="image-to-3d service unavailable")
+
+    content_type = (image.content_type or "").lower()
+    if content_type and not content_type.startswith("image/"):
+        raise HTTPException(status_code=400, detail="uploaded file must be an image")
+
+    image_bytes = await image.read()
+    if not image_bytes:
+        raise HTTPException(status_code=400, detail="image file is empty")
+
+    job = await image_to_3d_service.create_job(
+        prompt=prompt.strip(),
+        image_bytes=image_bytes,
+        filename_hint=filename.strip() or "image-model",
+        original_name=image.filename or "input.jpg",
+    )
+    return {"status": "accepted", "job": job}
+
+
+@app.get("/api/image-to-3d/jobs")
+async def list_image_to_3d_jobs():
+    if not image_to_3d_service:
+        raise HTTPException(status_code=500, detail="image-to-3d service unavailable")
+    return {"jobs": await image_to_3d_service.list_jobs()}
+
+
+@app.get("/api/image-to-3d/jobs/{job_id}")
+async def get_image_to_3d_job(job_id: str):
+    if not image_to_3d_service:
+        raise HTTPException(status_code=500, detail="image-to-3d service unavailable")
+    job = await image_to_3d_service.get_job(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="job not found")
+    return {"job": job}
+
+
+@app.post("/api/prompt-to-3d")
+async def create_prompt_to_3d_job(
+    prompt: str = Form(...),
+    filename_hint: str = Form(default="generated"),
+):
+    """Generate a 3D model from a text prompt using local coder-assisted mesh fallback."""
+    if not image_to_3d_service:
+        raise HTTPException(status_code=500, detail="image-to-3d service unavailable")
+    job = image_to_3d_service.create_prompt_job(prompt, filename_hint)
+    return {"job": job}
+
+
+@app.get("/api/image-to-3d/provider-check")
+async def image_to_3d_provider_check():
+    if not image_to_3d_service:
+        raise HTTPException(status_code=500, detail="image-to-3d service unavailable")
+    return {
+        "mode": "local_triposr_cli",
+        "configured": image_to_3d_service.cli_available,
+        "output_root": str(image_to_3d_service.obj_dir).replace("\\", "/"),
+        "python_executable": sys.executable,
+    }
+
+
+@app.get("/api/voice/status")
+async def voice_status():
+    if not voice_service:
+        return {"running": False, "message": "voice service unavailable"}
+    return voice_service.status()
+
+
+@app.post("/api/voice/start")
+async def voice_start():
+    if not voice_service:
+        raise HTTPException(status_code=500, detail="voice service unavailable")
+
+    loop = asyncio.get_running_loop()
+    ok, message = voice_service.start(loop)
+    if not ok:
+        raise HTTPException(status_code=500, detail=message)
+    return {"status": "ok", "message": message, "voice": voice_service.status()}
+
+
+@app.post("/api/voice/stop")
+async def voice_stop():
+    if not voice_service:
+        raise HTTPException(status_code=500, detail="voice service unavailable")
+    ok, message = voice_service.stop()
+    if not ok:
+        raise HTTPException(status_code=500, detail=message)
+    return {"status": "ok", "message": message, "voice": voice_service.status()}
+
+
+@app.post("/api/webcam/jobs")
+async def create_webcam_job(body: dict):
+    if not webcam_job_service:
+        raise HTTPException(status_code=500, detail="webcam job service unavailable")
+
+    prompt = str(body.get("prompt", "")).strip()
+    filename_hint = str(body.get("filename", "webcam-model")).strip()
+    frames = body.get("frames", [])
+    if not isinstance(frames, list):
+        raise HTTPException(status_code=400, detail="frames must be a list of base64 strings")
+    if len(frames) < 2:
+        raise HTTPException(status_code=400, detail="at least 2 frames are required")
+
+    prompt_for_generation = prompt if prompt else "reconstruct the object from captured webcam angles"
+    job = await webcam_job_service.create_job(prompt_for_generation, frames, filename_hint)
+    return {"status": "accepted", "job": job}
+
+
+@app.get("/api/webcam/jobs")
+async def list_webcam_jobs():
+    if not webcam_job_service:
+        raise HTTPException(status_code=500, detail="webcam job service unavailable")
+    return {"jobs": await webcam_job_service.list_jobs()}
+
+
+@app.get("/api/webcam/jobs/{job_id}")
+async def get_webcam_job(job_id: str):
+    if not webcam_job_service:
+        raise HTTPException(status_code=500, detail="webcam job service unavailable")
+    job = await webcam_job_service.get_job(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="job not found")
+    return {"job": job}
 
 
 # --- WebSocket for Unity Communication ---
@@ -614,43 +821,48 @@ async def websocket_endpoint(ws: WebSocket):
             elif msg_type == "command":
                 command_text = msg.get("command", "")
                 print(f"[ARK] Command: {command_text}")
-                # Send to Gemini for processing
-                result = await ask_gemini(command_text)
-                print(f"[ARK] Gemini response: {result}")
+                result = await process_command_text(command_text)
+                print(f"[ARK] Local coder response: {result}")
                 await ws.send_json({
                     "type": "command_result",
-                    "command": command_text,
-                    "action": result.get("action", "info"),
-                    "params": result.get("params", {}),
-                    "description": result.get("description", ""),
+                    **result,
                 })
 
             elif msg_type == "generate":
                 prompt = msg.get("prompt", "")
                 filename_hint = msg.get("filename", "model")
-                if not prompt:
-                    await ws.send_json({"type": "error", "message": "prompt is required"})
-                    continue
-                if len(prompt) > MAX_PROMPT_LEN:
-                    await ws.send_json({"type": "error", "message": f"prompt must be <= {MAX_PROMPT_LEN} chars"})
-                    continue
-                blocked, token = contains_blocked_prompt_text(prompt)
-                if blocked:
-                    await ws.send_json({"type": "error", "message": f"prompt contains blocked token: {token}"})
-                    continue
-
-                allowed, wait_seconds = enforce_generate_cooldown(f"ws:{id(ws)}")
-                if not allowed:
-                    await ws.send_json({"type": "error", "message": f"wait {wait_seconds}s before generating again"})
+                ok, message = validate_generate_request(prompt, f"ws:{id(ws)}")
+                if not ok:
+                    await ws.send_json({"type": "error", "message": message})
                     continue
 
                 print(f"[ARK] Generate request: {prompt}")
-                result = await generate_obj_from_prompt(prompt, filename_hint, ws=ws)
+                result = await generate_obj_from_prompt(prompt, filename_hint, ws=ws, source="ws")
                 await ws.send_json({
                     "type": "generate_result",
                     "prompt": prompt,
                     "result": result,
                 })
+
+            elif msg_type == "voice_start":
+                if not voice_service:
+                    await ws.send_json({"type": "error", "message": "voice service unavailable"})
+                    continue
+                ok, message = voice_service.start(asyncio.get_running_loop())
+                if not ok:
+                    await ws.send_json({"type": "error", "message": message})
+                    continue
+                await ws.send_json({"type": "voice_status", "status": "running", "message": message})
+
+            elif msg_type == "voice_stop":
+                if not voice_service:
+                    await ws.send_json({"type": "error", "message": "voice service unavailable"})
+                    continue
+                ok, message = voice_service.stop()
+                if not ok:
+                    await ws.send_json({"type": "error", "message": message})
+                    continue
+                await ws.send_json({"type": "voice_status", "status": "stopped", "message": message})
 
             else:
                 await ws.send_json({"type": "echo", "received": msg})
@@ -667,9 +879,8 @@ if __name__ == "__main__":
     port = int(os.getenv("PORT", "8000"))
     ensure_generated_dirs()
     blender_path = resolve_blender_path()
-    initialize_gemini_model()
     print(f"[ARK] Starting server on {host}:{port}")
-    print(f"[ARK] Gemini API key: {'configured' if GEMINI_API_KEY else 'MISSING'}")
-    print(f"[ARK] Gemini model: {active_model_name if active_model_name else 'MISSING'}")
+    print(f"[ARK] Local coder URL: {LOCAL_CODER_URL}")
+    print(f"[ARK] Local coder model: {LOCAL_CODER_MODEL}")
     print(f"[ARK] Blender path: {blender_path if blender_path else 'MISSING'}")
     uvicorn.run(app, host=host, port=port)
