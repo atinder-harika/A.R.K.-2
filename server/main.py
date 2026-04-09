@@ -27,8 +27,9 @@ from image_to_3d_service import ImageTo3DService
 ENV_PATH = Path(__file__).resolve().parent / ".env"
 load_dotenv(dotenv_path=ENV_PATH)
 
-LOCAL_CODER_URL = os.getenv("LOCAL_CODER_URL", "http://localhost:11434/api/generate")
-LOCAL_CODER_MODEL = os.getenv("LOCAL_CODER_MODEL", "qwen2.5-coder:7b")
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "").strip()
+GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash").strip() or "gemini-2.5-flash"
+GEMINI_API_URL = f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_MODEL}:generateContent"
 FASTER_WHISPER_MODEL = os.getenv("FASTER_WHISPER_MODEL", "tiny.en")
 FASTER_WHISPER_DEVICE = os.getenv("FASTER_WHISPER_DEVICE", "cpu")
 FASTER_WHISPER_COMPUTE_TYPE = os.getenv("FASTER_WHISPER_COMPUTE_TYPE", "int8")
@@ -45,10 +46,160 @@ ARK_COMMAND_SYSTEM_PROMPT = (
 
 BLENDER_SCRIPT_SYSTEM_PROMPT = (
     "You are an expert Python Blender Developer. "
-    "Write a script to generate the requested 3D model. "
+    "Write a script to generate the requested 3D model with rich, production-looking geometry. "
+    "Use multiple named parts, believable proportions, and enough surface detail that the result looks intentional rather than like a placeholder. "
+    "Prefer extrusion, bevels, modifiers, and separate semantic sub-objects when they improve the model. "
     "CRITICAL: Do NOT join meshes (bpy.ops.object.join()). "
     "Keep distinct parts as separate objects in the hierarchy. "
     "Ensure the script exports an OBJ."
+)
+
+VOICE_EDIT_MATERIAL_COLORS = {
+    "metallic gray": "#8a8a8a",
+    "metallic grey": "#8a8a8a",
+    "metallic": "#8a8a8a",
+    "gray": "#808080",
+    "grey": "#808080",
+    "silver": "#c0c0c0",
+    "gold": "#d4af37",
+    "black": "#000000",
+    "white": "#ffffff",
+    "red": "#ff0000",
+    "blue": "#0000ff",
+    "green": "#00ff00",
+    "purple": "#800080",
+    "pink": "#ffc0cb",
+}
+
+VOICE_EDIT_TARGET_ALIASES = {
+    "case": "body",
+    "shell": "body",
+    "cover": "body",
+    "housing": "body",
+    "body": "body",
+    "lid": "lid",
+    "top": "lid",
+    "logo": "logo",
+    "sticker": "logo",
+    "decal": "logo",
+    "emblem": "logo",
+    "panel": "panel",
+    "part": "body",
+    "surface": "body",
+    "object": "body",
+    "model": "body",
+    "it": "body",
+    "this": "body",
+    "that": "body",
+}
+
+VOICE_EDIT_MATERIAL_PATTERN = "|".join(sorted((re.escape(token) for token in VOICE_EDIT_MATERIAL_COLORS), key=len, reverse=True))
+EDIT_TARGET_HINTS = {
+    "body",
+    "lid",
+    "logo",
+    "stem",
+    "wheel",
+    "cone",
+    "handle",
+    "button",
+    "panel",
+    "base",
+    "cap",
+    "ring",
+    "tag",
+    "earbud",
+    "case",
+    "shell",
+    "screen",
+    "door",
+    "arm",
+    "leg",
+    "foot",
+    "nose",
+    "eye",
+    "switch",
+    "trigger",
+    "strap",
+    "antenna",
+}
+EDIT_TARGET_STOPWORDS = {
+    "a",
+    "an",
+    "the",
+    "this",
+    "that",
+    "it",
+    "its",
+    "their",
+    "my",
+    "your",
+    "of",
+    "for",
+    "to",
+    "into",
+    "with",
+    "as",
+    "on",
+    "in",
+    "from",
+    "make",
+    "change",
+    "set",
+    "turn",
+    "paint",
+    "apply",
+    "give",
+    "coat",
+    "cover",
+    "texture",
+    "color",
+    "coloured",
+    "colored",
+    "metallic",
+    "gray",
+    "grey",
+    "silver",
+    "gold",
+    "red",
+    "blue",
+    "green",
+    "black",
+    "white",
+    "purple",
+    "pink",
+}
+EDIT_TARGET_PREFIXES = {
+    "texture",
+    "color",
+    "colour",
+    "material",
+    "material of",
+    "texture of",
+    "surface of",
+    "finish of",
+    "part of",
+}
+LOW_DETAIL_GEOMETRY_MARKERS = (
+    "primitive_cube_add",
+    "primitive_uv_sphere_add",
+    "primitive_cylinder_add",
+    "primitive_cone_add",
+    "primitive_torus_add",
+    "primitive_ico_sphere_add",
+    "primitive_plane_add",
+)
+RICH_GEOMETRY_MARKERS = (
+    "bevel",
+    "subdivision",
+    "subsurf",
+    "solidify",
+    "extrude",
+    "array",
+    "mirror",
+    "boolean",
+    "curve",
+    "screw",
 )
 
 app = FastAPI(title="A.R.K. Server", version="0.1.0")
@@ -130,15 +281,56 @@ def resolve_blender_path() -> str:
     return ""
 
 
-def query_local_coder(prompt: str) -> str:
-    """Queries the local Ollama instance running Qwen2.5-Coder."""
-    payload = {"model": LOCAL_CODER_MODEL, "prompt": prompt, "stream": False}
-    try:
-        response = requests.post(LOCAL_CODER_URL, json=payload, timeout=60)
-        response.raise_for_status()
-        return response.json().get("response", "")
-    except Exception as e:
+def query_gemini(prompt: str, system_instruction: str = "", response_mime_type: str = "text/plain") -> str:
+    if not GEMINI_API_KEY:
+        raise RuntimeError("GEMINI_API_KEY is not set")
+
+    payload: dict = {
+        "contents": [
+            {
+                "role": "user",
+                "parts": [{"text": prompt}],
+            }
+        ],
+        "generationConfig": {
+            "temperature": 0.2,
+            "maxOutputTokens": 2048,
+        },
+    }
+
+    if system_instruction.strip():
+        payload["systemInstruction"] = {
+            "parts": [{"text": system_instruction.strip()}],
+        }
+
+    if response_mime_type:
+        payload["generationConfig"]["responseMimeType"] = response_mime_type
+
+    response = requests.post(
+        GEMINI_API_URL,
+        params={"key": GEMINI_API_KEY},
+        json=payload,
+        timeout=60,
+    )
+    response.raise_for_status()
+    data = response.json()
+
+    candidates = data.get("candidates") or []
+    if not candidates:
         return ""
+
+    content = candidates[0].get("content") or {}
+    parts = content.get("parts") or []
+    text_parts = [part.get("text", "") for part in parts if isinstance(part, dict)]
+    return "".join(text_parts).strip()
+
+
+def describe_language_model_runtime() -> dict:
+    return {
+        "active_provider": "gemini",
+        "gemini_model": GEMINI_MODEL,
+        "gemini_configured": bool(GEMINI_API_KEY),
+    }
 
 
 def to_relative_artifact_path(path: Path) -> str:
@@ -269,6 +461,16 @@ def validate_blender_script(script_text: str) -> tuple[bool, str]:
     return True, ""
 
 
+def is_low_detail_blender_script(script_text: str) -> tuple[bool, str]:
+    lower_script = script_text.lower()
+    primitive_count = sum(lower_script.count(marker) for marker in LOW_DETAIL_GEOMETRY_MARKERS)
+
+    if primitive_count <= 2 and not any(marker in lower_script for marker in RICH_GEOMETRY_MARKERS):
+        return True, "generated script was too simple; expected richer geometry"
+
+    return False, ""
+
+
 def normalize_obj_export(script_text: str) -> str:
     modularity_block = (
         "\n"
@@ -337,6 +539,94 @@ def contains_blocked_prompt_text(user_prompt: str) -> tuple[bool, str]:
     return False, ""
 
 
+def normalize_voice_edit_target(target_text: str) -> str:
+    cleaned = re.sub(r"[^a-z0-9\s_-]+", " ", target_text.lower()).strip()
+    if not cleaned:
+        return "body"
+
+    tokens = cleaned.split()
+    while tokens and tokens[0] in EDIT_TARGET_STOPWORDS:
+        tokens.pop(0)
+
+    cleaned = " ".join(tokens).strip()
+    if not cleaned:
+        return "body"
+
+    for prefix in sorted(EDIT_TARGET_PREFIXES, key=len, reverse=True):
+        if cleaned.startswith(prefix + " "):
+            cleaned = cleaned[len(prefix):].strip()
+            break
+
+    tokens = [token for token in cleaned.split() if token not in EDIT_TARGET_STOPWORDS]
+    if not tokens:
+        return "body"
+
+    for alias, normalized in VOICE_EDIT_TARGET_ALIASES.items():
+        if re.search(rf"\b{re.escape(alias)}\b", cleaned):
+            return normalized
+
+    for token in tokens:
+        if token in EDIT_TARGET_HINTS:
+            return token
+
+    for token in reversed(tokens):
+        if token not in EDIT_TARGET_STOPWORDS:
+            return token
+
+    return tokens[-1]
+
+
+def infer_material_edit_intent(text: str) -> dict | None:
+    lower = text.strip().lower()
+    material_match = re.search(
+        rf"\b(?:make|change|set|turn|paint|apply|give|coat|cover)\b"
+        rf"(?:\s+(?:the|this|that|it|its))?"
+        rf"(?:\s+(?P<target>.+?))?"
+        rf"\s+(?:to|into|with|as)?\s*(?P<material>{VOICE_EDIT_MATERIAL_PATTERN})\b",
+        lower,
+    )
+    if not material_match:
+        return None
+
+    target = normalize_voice_edit_target(material_match.group("target") or "")
+    material = material_match.group("material").strip()
+    return {
+        "intent": "edit_unity",
+        "mode": "material",
+        "target": target,
+        "material": material,
+        "color": VOICE_EDIT_MATERIAL_COLORS.get(material, "#808080"),
+        "description": f"Applied {material} to {target}.",
+    }
+
+
+def infer_asset_edit_intent(text: str) -> dict | None:
+    lower = text.strip().lower()
+    asset_match = re.search(
+        r"(?:replace|swap|change)(?:\s+the)?\s+(.+?)\s+(?:with|to)\s+(?:a\s+|an\s+)?(.+?)(?:\s+sticker|\s+decal|\s+logo)?(?:\.|$)",
+        lower,
+    )
+    if not asset_match or not any(token in lower for token in ("sticker", "logo", "decal")):
+        return None
+
+    target = normalize_voice_edit_target(asset_match.group(1))
+    asset = asset_match.group(2).strip(" .,:;\"'`")
+    return {
+        "intent": "edit_unity",
+        "mode": "asset_swap",
+        "target": target,
+        "asset_name": asset,
+        "description": f"Replaced {target} with {asset}.",
+    }
+
+
+def infer_edit_unity_intent(text: str) -> dict | None:
+    material_intent = infer_material_edit_intent(text)
+    if material_intent:
+        return material_intent
+    return infer_asset_edit_intent(text)
+
+
 def enforce_generate_cooldown(client_key: str) -> tuple[bool, int]:
     now_ts = datetime.now(timezone.utc).timestamp()
     last_ts = generation_last_seen.get(client_key, 0)
@@ -353,7 +643,12 @@ async def query_local_command(prompt: str) -> dict:
     """Send a prompt to local coder and parse the JSON action response."""
     try:
         full_prompt = f"{ARK_COMMAND_SYSTEM_PROMPT}\n\nUser command: {prompt}\n\nRespond with ONLY valid JSON."
-        text = await asyncio.to_thread(query_local_coder, full_prompt)
+        text = await asyncio.to_thread(
+            query_gemini,
+            full_prompt,
+            ARK_COMMAND_SYSTEM_PROMPT,
+            "application/json",
+        )
         text = text.strip()
         # Strip markdown code fences if present
         if text.startswith("```"):
@@ -370,35 +665,57 @@ async def query_local_blender_script(user_prompt: str, obj_output_path: Path) ->
     prompt = (
         f"{BLENDER_SCRIPT_SYSTEM_PROMPT}\n"
         "Output only Python code with no markdown and no explanation.\n"
-        "Use bpy only. Clear default scene objects, build geometry that matches the request, and keep parts modular.\n"
+        "Use bpy only. Clear the default scene, then build a detailed model that matches the request.\n"
+        "Use multiple parts, meaningful proportions, and enough structure that the model looks finished instead of like a placeholder.\n"
+        "Prefer rich geometry such as extrusions, bevels, modifiers, and named sub-objects when they fit the request.\n"
         "Do not import os/sys/socket/subprocess/requests.\n"
         f"Output path: {obj_output_path.as_posix()}\n"
         f"User request: {user_prompt}\n"
     )
 
-    raw_text = await asyncio.to_thread(query_local_coder, prompt)
+    raw_text = await asyncio.to_thread(query_gemini, prompt, BLENDER_SCRIPT_SYSTEM_PROMPT)
     script_text = strip_code_fence(raw_text)
     script_text = normalize_obj_export(script_text)
     script_text = script_text.replace("{OBJ_PATH}", obj_output_path.as_posix())
     is_valid, reason = validate_blender_script(script_text)
     if not is_valid:
         raise ValueError(reason)
+    is_low_detail, detail_reason = is_low_detail_blender_script(script_text)
+    if is_low_detail:
+        raise ValueError(detail_reason)
     return script_text
 
 
 async def query_voice_intent(text: str) -> dict:
+    deterministic = infer_voice_intent_fallback(text)
+    if str(deterministic.get("intent", "")).strip().lower() in {"generate_blender", "edit_unity"}:
+        return deterministic
+
     prompt = (
         f"Analyze this user command: '{text}'. Return ONLY valid JSON. "
         "If making a new 3D model, return {\"intent\": \"generate_blender\", \"prompt\": \"<command>\"}. "
-        "If modifying color/material of an existing part, return {\"intent\": \"edit_unity\", \"target\": \"<part_name>\", \"color\": \"<color_name>\"}."
+        "If modifying color/material of an existing part, return {\"intent\": \"edit_unity\", \"target\": \"<part_name>\", \"color\": \"<color_name>\"}. "
+        "The target must be exactly one clean noun token that names the mesh grouping, such as stem, body, wheel, cone, lid, logo, or earbud. "
+        "Do not include grammar, articles, prepositions, or surrounding context. Do not output phrases like 'texture of the', 'color of the', or 'make the'. "
+        "If uncertain, choose the shortest likely mesh name. Prefer edit_unity for material, sticker, logo, decal, and color-change requests on an existing object."
     )
-    raw = await asyncio.to_thread(query_local_coder, prompt)
+    raw = await asyncio.to_thread(query_gemini, prompt, "", "application/json")
     if not raw.strip():
-        return infer_voice_intent_fallback(text)
+        return deterministic
     try:
-        return json.loads(strip_code_fence(raw))
+        parsed = json.loads(strip_code_fence(raw))
+        intent = str(parsed.get("intent", "")).strip().lower()
+        if intent not in {"generate_blender", "edit_unity"}:
+            fallback = deterministic
+            if str(fallback.get("intent", "")).strip().lower() in {"generate_blender", "edit_unity"}:
+                return fallback
+        if intent == "generate_blender" and str(deterministic.get("intent", "")).strip().lower() == "edit_unity":
+            return deterministic
+        if intent == "edit_unity":
+            parsed["target"] = normalize_voice_edit_target(str(parsed.get("target", "")))
+        return parsed
     except Exception:
-        return infer_voice_intent_fallback(text)
+        return deterministic
 
 
 async def run_blender_script(script_path: Path) -> tuple[bool, int, str, str, str]:
@@ -677,6 +994,10 @@ def infer_voice_intent_fallback(text: str) -> dict:
     if simple_command:
         return {"intent": "command_fallback", "source": simple_command}
 
+    edit_intent = infer_edit_unity_intent(normalized)
+    if edit_intent:
+        return edit_intent
+
     generation_match = re.search(
         r"\b(?:make|create|generate|build|design|model|sculpt|render)\b\s*(.+)",
         lower,
@@ -704,6 +1025,17 @@ def transcribe_audio_file(audio_path: Path) -> tuple[str, str]:
 
     try:
         import speech_recognition as sr  # type: ignore[import-not-found]
+    except ModuleNotFoundError as exc:
+        if exc.name == "aifc":
+            raise RuntimeError(
+                "audio transcription fallback is unavailable because speech_recognition requires the removed Python 3.13 aifc module; "
+                "the repository now includes a compatibility shim, so verify the server package is being imported from this workspace"
+            ) from exc
+        raise RuntimeError(
+            f"audio transcription failed; local engine error: {local_engine_error or 'unknown'}; fallback import error: {exc}"
+        ) from exc
+
+    try:
         recognizer = sr.Recognizer()
         with sr.AudioFile(str(audio_path)) as source:
             audio_data = recognizer.record(source)
@@ -723,13 +1055,25 @@ async def process_voice_text(text: str) -> dict:
 
     # For explicit generation phrases, skip LLM intent parsing and generate directly.
     deterministic_intent = infer_voice_intent_fallback(normalized_text)
-    if str(deterministic_intent.get("intent", "")).strip().lower() == "generate_blender":
+    deterministic_mode = str(deterministic_intent.get("intent", "")).strip().lower()
+    if deterministic_mode == "generate_blender":
         prompt = str(deterministic_intent.get("prompt", normalized_text)).strip() or normalized_text
         result = await generate_obj_from_prompt(prompt, "voice-model", source="voice_text")
         return {
             "transcript": text,
             "intent": deterministic_intent,
             "result": result,
+        }
+
+    if deterministic_mode == "edit_unity":
+        await broadcast_unity_event({
+            "type": "edit_unity",
+            **deterministic_intent,
+        })
+        return {
+            "transcript": text,
+            "intent": deterministic_intent,
+            "result": {"status": "sent_to_unity"},
         }
 
     intent_json = await query_voice_intent(normalized_text)
@@ -1022,21 +1366,18 @@ async def root():
 async def health():
     image_provider = {
         "configured": False,
-        "mode": "local_triposr_cli",
+        "mode": "triposg",
         "python_executable": sys.executable,
     }
     if image_to_3d_service:
         image_provider = {
-            "configured": image_to_3d_service.cli_available,
-            "mode": "local_triposr_cli",
+            **image_to_3d_service.describe_provider(),
             "python_executable": sys.executable,
-            "output_root": str(image_to_3d_service.obj_dir).replace("\\", "/"),
         }
 
     return {
         "status": "healthy",
-        "local_coder_url": LOCAL_CODER_URL,
-        "local_coder_model": LOCAL_CODER_MODEL,
+        "language_model": describe_language_model_runtime(),
         "connected_clients": len(connected_clients),
         "blender_available": bool(blender_path),
         "blender_path": blender_path,
@@ -1212,9 +1553,7 @@ async def image_to_3d_provider_check():
     if not image_to_3d_service:
         raise HTTPException(status_code=500, detail="image-to-3d service unavailable")
     return {
-        "mode": "local_triposr_cli",
-        "configured": image_to_3d_service.cli_available,
-        "output_root": str(image_to_3d_service.obj_dir).replace("\\", "/"),
+        **image_to_3d_service.describe_provider(),
         "python_executable": sys.executable,
     }
 
@@ -1397,7 +1736,9 @@ if __name__ == "__main__":
     ensure_generated_dirs()
     blender_path = resolve_blender_path()
     print(f"[ARK] Starting server on {host}:{port}")
-    print(f"[ARK] Local coder URL: {LOCAL_CODER_URL}")
-    print(f"[ARK] Local coder model: {LOCAL_CODER_MODEL}")
+    language_model = describe_language_model_runtime()
+    print(f"[ARK] Language model provider: {language_model['active_provider']}")
+    print(f"[ARK] Gemini configured: {'yes' if language_model['gemini_configured'] else 'no'}")
+    print(f"[ARK] Gemini model: {language_model['gemini_model']}")
     print(f"[ARK] Blender path: {blender_path if blender_path else 'MISSING'}")
     uvicorn.run(app, host=host, port=port)

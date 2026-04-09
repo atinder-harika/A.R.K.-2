@@ -20,6 +20,8 @@ class HealthEndpointTest(unittest.TestCase):
         self.assertEqual(response.status_code, 200)
         payload = response.json()
         self.assertEqual(payload.get("status"), "healthy")
+        self.assertEqual(payload.get("language_model", {}).get("active_provider"), "gemini")
+        self.assertEqual(payload.get("image_to_3d", {}).get("mode"), "triposg")
 
 
 if __name__ == "__main__":
