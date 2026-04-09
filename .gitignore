@@ -209,6 +209,8 @@ marimo/_lsp/
 __marimo__/
 
 /ARK - UNITY  - EXPORT ASSET/
+/Agents/
+/server/external/
 
 # Python
 __pycache__/

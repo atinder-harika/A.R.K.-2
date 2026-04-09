@@ -4,11 +4,14 @@ FastAPI Backend Server
 """
 
 import json
+import base64
+import binascii
 import os
 import re
 import shutil
 import uuid
 import asyncio
+import tempfile
 import sys
 import requests
 from collections import deque
@@ -26,6 +29,9 @@ load_dotenv(dotenv_path=ENV_PATH)
 
 LOCAL_CODER_URL = os.getenv("LOCAL_CODER_URL", "http://localhost:11434/api/generate")
 LOCAL_CODER_MODEL = os.getenv("LOCAL_CODER_MODEL", "qwen2.5-coder:7b")
+FASTER_WHISPER_MODEL = os.getenv("FASTER_WHISPER_MODEL", "tiny.en")
+FASTER_WHISPER_DEVICE = os.getenv("FASTER_WHISPER_DEVICE", "cpu")
+FASTER_WHISPER_COMPUTE_TYPE = os.getenv("FASTER_WHISPER_COMPUTE_TYPE", "int8")
 
 ARK_COMMAND_SYSTEM_PROMPT = (
     "You are A.R.K., an Augmented Reality Kinetic Interface assistant. "
@@ -83,6 +89,7 @@ blender_path = ""
 generation_last_seen: dict[str, float] = {}
 voice_service: VoiceCommandService | None = None
 image_to_3d_service: ImageTo3DService | None = None
+_faster_whisper_model = None
 
 
 def now_iso() -> str:
@@ -131,8 +138,7 @@ def query_local_coder(prompt: str) -> str:
         response.raise_for_status()
         return response.json().get("response", "")
     except Exception as e:
-        print(f"Local LLM Error: {e}")
-        return "{}"
+        return ""
 
 
 def to_relative_artifact_path(path: Path) -> str:
@@ -146,6 +152,76 @@ def sanitize_filename(value: str) -> str:
     base = re.sub(r"[^a-zA-Z0-9_-]+", "-", value.strip().lower())
     base = re.sub(r"-{2,}", "-", base).strip("-")
     return base or "model"
+
+
+def get_faster_whisper_model():
+    global _faster_whisper_model
+    if _faster_whisper_model is not None:
+        return _faster_whisper_model
+
+    try:
+        from faster_whisper import WhisperModel  # type: ignore[import-not-found]
+    except Exception as exc:
+        raise RuntimeError(f"faster-whisper is not installed: {exc}") from exc
+
+    _faster_whisper_model = WhisperModel(
+        FASTER_WHISPER_MODEL,
+        device=FASTER_WHISPER_DEVICE,
+        compute_type=FASTER_WHISPER_COMPUTE_TYPE,
+    )
+    return _faster_whisper_model
+
+
+def decode_base64_payload(payload: str) -> bytes:
+    cleaned = payload.strip()
+    if "," in cleaned and cleaned.lower().startswith("data:"):
+        cleaned = cleaned.split(",", 1)[1]
+
+    try:
+        return base64.b64decode(cleaned, validate=True)
+    except binascii.Error as exc:
+        raise ValueError(f"invalid base64 payload: {exc}") from exc
+
+
+def summarize_ws_payload(raw_text: str) -> str:
+    """Redact large base64 fields before logging websocket payloads."""
+    try:
+        payload = json.loads(raw_text)
+    except Exception:
+        return raw_text[:400] + ("..." if len(raw_text) > 400 else "")
+
+    if isinstance(payload, dict):
+        summary = dict(payload)
+        for key in ("audio_base64", "image_base64"):
+            if key in summary and isinstance(summary[key], str):
+                summary[key] = f"<redacted:{len(summary[key])} chars>"
+        return json.dumps(summary, ensure_ascii=True)
+
+    return raw_text[:400] + ("..." if len(raw_text) > 400 else "")
+
+
+def validate_obj_modularity(obj_path: Path) -> tuple[bool, str]:
+    if not obj_path.exists():
+        return False, f"obj file not found: {obj_path}"
+
+    object_names: list[str] = []
+    group_names: list[str] = []
+    with obj_path.open("r", encoding="utf-8", errors="ignore") as handle:
+        for line in handle:
+            stripped = line.strip()
+            if stripped.startswith("o "):
+                object_names.append(stripped[2:].strip())
+            elif stripped.startswith("g "):
+                group_names.append(stripped[2:].strip())
+
+    distinct_objects = {name for name in object_names if name}
+    distinct_groups = {name for name in group_names if name}
+    if len(distinct_objects) >= 2 or len(distinct_groups) >= 2:
+        return True, "ok"
+
+    return False, (
+        "obj must contain at least two distinct object/group tags so Unity can spawn separate child objects"
+    )
 
 
 def strip_code_fence(text: str) -> str:
@@ -194,14 +270,38 @@ def validate_blender_script(script_text: str) -> tuple[bool, str]:
 
 
 def normalize_obj_export(script_text: str) -> str:
+    modularity_block = (
+        "\n"
+        "# split disconnected mesh islands into separate objects for Unity child hierarchies\n"
+        "for _ark_obj in list(bpy.context.scene.objects):\n"
+        "    if _ark_obj.type != 'MESH':\n"
+        "        continue\n"
+        "    bpy.ops.object.select_all(action='DESELECT')\n"
+        "    _ark_obj.select_set(True)\n"
+        "    bpy.context.view_layer.objects.active = _ark_obj\n"
+        "    try:\n"
+        "        bpy.ops.object.mode_set(mode='EDIT')\n"
+        "        bpy.ops.mesh.select_all(action='SELECT')\n"
+        "        bpy.ops.mesh.separate(type='LOOSE')\n"
+        "        bpy.ops.object.mode_set(mode='OBJECT')\n"
+        "    except Exception as _ark_split_error:\n"
+        "        print(f'Could not split {_ark_obj.name}: {_ark_split_error}')\n"
+    )
+
     export_block = (
         "\n"
         "# export obj across blender versions\n"
         "output_filepath = OUTPUT_OBJ_PATH\n"
         "if hasattr(bpy.ops.wm, 'obj_export'):\n"
-        "    bpy.ops.wm.obj_export(filepath=output_filepath, export_selected_objects=False)\n"
+        "    try:\n"
+        "        bpy.ops.wm.obj_export(filepath=output_filepath, export_selected_objects=False, export_materials=False)\n"
+        "    except TypeError:\n"
+        "        bpy.ops.wm.obj_export(filepath=output_filepath, export_selected_objects=False)\n"
         "elif hasattr(bpy.ops.export_scene, 'obj'):\n"
-        "    bpy.ops.export_scene.obj(filepath=output_filepath, use_selection=False)\n"
+        "    try:\n"
+        "        bpy.ops.export_scene.obj(filepath=output_filepath, use_selection=False, use_materials=False)\n"
+        "    except TypeError:\n"
+        "        bpy.ops.export_scene.obj(filepath=output_filepath, use_selection=False)\n"
         "else:\n"
         "    raise RuntimeError('obj export operator not found in this blender build')\n"
     )
@@ -226,7 +326,7 @@ def normalize_obj_export(script_text: str) -> str:
     cleaned = base
     cleaned = cleaned.replace("import bpy\n", "")
     cleaned = cleaned.replace("import math\n", "")
-    return f"{header}{cleaned}\n{export_block}"
+    return f"{header}{cleaned}{modularity_block}\n{export_block}"
 
 
 def contains_blocked_prompt_text(user_prompt: str) -> tuple[bool, str]:
@@ -293,10 +393,12 @@ async def query_voice_intent(text: str) -> dict:
         "If modifying color/material of an existing part, return {\"intent\": \"edit_unity\", \"target\": \"<part_name>\", \"color\": \"<color_name>\"}."
     )
     raw = await asyncio.to_thread(query_local_coder, prompt)
+    if not raw.strip():
+        return infer_voice_intent_fallback(text)
     try:
         return json.loads(strip_code_fence(raw))
     except Exception:
-        return {"intent": "generate_blender", "prompt": text}
+        return infer_voice_intent_fallback(text)
 
 
 async def run_blender_script(script_path: Path) -> tuple[bool, int, str, str, str]:
@@ -399,6 +501,271 @@ def validate_generate_request(prompt: str, client_key: str) -> tuple[bool, str]:
     return True, ""
 
 
+def is_audio_filename(filename: str) -> bool:
+    suffix = Path(filename or "").suffix.lower()
+    return suffix in {".wav", ".flac", ".aiff", ".aif", ".aifc"}
+
+
+def build_modular_fallback_script(user_prompt: str, obj_output_path: Path) -> str:
+    lower_prompt = user_prompt.lower()
+
+    if "apple" in lower_prompt:
+        return (
+            "import bpy\n"
+            "import math\n"
+            "OUTPUT_OBJ_PATH = r\"{OBJ_PATH}\"\n"
+            "\n"
+            "bpy.ops.wm.read_factory_settings(use_empty=True)\n"
+            "\n"
+            "bpy.ops.mesh.primitive_uv_sphere_add(segments=80, ring_count=40, radius=1.0, location=(0.0, 0.0, 0.0))\n"
+            "body = bpy.context.object\n"
+            "body.name = 'body'\n"
+            "body.scale = (1.0, 1.0, 1.08)\n"
+            "bpy.ops.object.shade_smooth()\n"
+            "\n"
+            "bpy.ops.mesh.primitive_cylinder_add(vertices=24, radius=0.08, depth=0.45, location=(0.0, 0.0, 1.22))\n"
+            "stem = bpy.context.object\n"
+            "stem.name = 'stem'\n"
+            "stem.rotation_euler = (0.25, 0.0, 0.0)\n"
+            "\n"
+            "bpy.ops.mesh.primitive_plane_add(size=0.45, location=(0.28, 0.0, 1.33))\n"
+            "leaf = bpy.context.object\n"
+            "leaf.name = 'leaf'\n"
+            "leaf.rotation_euler = (0.2, 0.9, 0.3)\n"
+            "solid = leaf.modifiers.new(name='Solidify', type='SOLIDIFY')\n"
+            "solid.thickness = 0.02\n"
+            "bpy.ops.object.modifier_apply(modifier='Solidify')\n"
+            "\n"
+            "for obj in [body, stem, leaf]:\n"
+            "    bpy.ops.object.select_all(action='DESELECT')\n"
+            "    obj.select_set(True)\n"
+            "    bpy.context.view_layer.objects.active = obj\n"
+            "    bpy.ops.object.transform_apply(location=False, rotation=False, scale=True)\n"
+            "\n"
+            "if hasattr(bpy.ops.wm, 'obj_export'):\n"
+            "    try:\n"
+            "        bpy.ops.wm.obj_export(filepath=OUTPUT_OBJ_PATH, export_selected_objects=False, export_materials=False)\n"
+            "    except TypeError:\n"
+            "        bpy.ops.wm.obj_export(filepath=OUTPUT_OBJ_PATH, export_selected_objects=False)\n"
+            "else:\n"
+            "    try:\n"
+            "        bpy.ops.export_scene.obj(filepath=OUTPUT_OBJ_PATH, use_selection=False, use_materials=False)\n"
+            "    except TypeError:\n"
+            "        bpy.ops.export_scene.obj(filepath=OUTPUT_OBJ_PATH, use_selection=False)\n"
+        ).replace("{OBJ_PATH}", obj_output_path.as_posix())
+
+    if "keychain" in lower_prompt:
+        object_plan = [
+            ("ring", "torus", (0.0, 0.0, 0.0), (0.65, 0.65, 0.18)),
+            ("tag", "cube", (1.8, 0.0, 0.0), (0.65, 0.18, 0.9)),
+        ]
+    elif "car" in lower_prompt:
+        object_plan = [
+            ("body", "cube", (0.0, 0.0, 0.4), (1.4, 0.75, 0.35)),
+            ("wheel_fl", "cylinder", (-0.9, 0.75, -0.2), (0.32, 0.32, 0.18)),
+            ("wheel_fr", "cylinder", (0.9, 0.75, -0.2), (0.32, 0.32, 0.18)),
+            ("wheel_rl", "cylinder", (-0.9, -0.75, -0.2), (0.32, 0.32, 0.18)),
+            ("wheel_rr", "cylinder", (0.9, -0.75, -0.2), (0.32, 0.32, 0.18)),
+        ]
+    else:
+        object_plan = [
+            ("part_a", "cube", (-1.0, 0.0, 0.0), (0.7, 0.7, 0.7)),
+            ("part_b", "cube", (1.0, 0.0, 0.0), (0.5, 0.5, 0.5)),
+        ]
+
+    object_lines = []
+    for name, shape, location, scale in object_plan:
+        object_lines.extend([
+            f"obj = add_{shape}('{name}', {location}, {scale})",
+            "objects.append(obj)",
+        ])
+
+    return (
+        "import bpy\n"
+        "import math\n"
+        "OUTPUT_OBJ_PATH = r\"{OBJ_PATH}\"\n"
+        "\n"
+        "def add_cube(name, location, scale):\n"
+        "    bpy.ops.mesh.primitive_cube_add(location=location)\n"
+        "    obj = bpy.context.object\n"
+        "    obj.name = name\n"
+        "    obj.scale = scale\n"
+        "    return obj\n"
+        "\n"
+        "def add_torus(name, location, scale):\n"
+        "    bpy.ops.mesh.primitive_torus_add(location=location, major_segments=24, minor_segments=8)\n"
+        "    obj = bpy.context.object\n"
+        "    obj.name = name\n"
+        "    obj.scale = scale\n"
+        "    return obj\n"
+        "\n"
+        "def add_cylinder(name, location, scale):\n"
+        "    bpy.ops.mesh.primitive_cylinder_add(location=location, vertices=16)\n"
+        "    obj = bpy.context.object\n"
+        "    obj.name = name\n"
+        "    obj.scale = scale\n"
+        "    return obj\n"
+        "\n"
+        "bpy.ops.wm.read_factory_settings(use_empty=True)\n"
+        "objects = []\n"
+        f"{chr(10).join(object_lines)}\n"
+        "bpy.ops.object.select_all(action='DESELECT')\n"
+        "for obj in objects:\n"
+        "    obj.select_set(True)\n"
+        "    bpy.context.view_layer.objects.active = obj\n"
+        "    bpy.ops.object.transform_apply(location=False, rotation=False, scale=True)\n"
+        "if hasattr(bpy.ops.wm, 'obj_export'):\n"
+        "    try:\n"
+        "        bpy.ops.wm.obj_export(filepath=OUTPUT_OBJ_PATH, export_selected_objects=False, export_materials=False)\n"
+        "    except TypeError:\n"
+        "        bpy.ops.wm.obj_export(filepath=OUTPUT_OBJ_PATH, export_selected_objects=False)\n"
+        "else:\n"
+        "    try:\n"
+        "        bpy.ops.export_scene.obj(filepath=OUTPUT_OBJ_PATH, use_selection=False, use_materials=False)\n"
+        "    except TypeError:\n"
+        "        bpy.ops.export_scene.obj(filepath=OUTPUT_OBJ_PATH, use_selection=False)\n"
+    ).replace("{OBJ_PATH}", obj_output_path.as_posix())
+
+
+def parse_simple_command(text: str) -> dict | None:
+    lower = text.strip().lower()
+    if not lower:
+        return None
+
+    rotate_match = re.search(r"rotate(?:\s+the)?(?:\s+model|\s+object)?\s+(left|right)(?:\s+(\d+))?", lower)
+    if rotate_match:
+        direction = rotate_match.group(1)
+        degrees = int(rotate_match.group(2) or "15")
+        signed = -degrees if direction == "left" else degrees
+        return {
+            "action": "rotate",
+            "params": {"axis": "y", "value": signed},
+            "description": f"Rotated model {degrees} degrees to the {direction} around the Y-axis.",
+        }
+
+    scale_match = re.search(r"scale(?:\s+the)?(?:\s+model|\s+object)?\s+(?:up|down)?\s*(\d+)%", lower)
+    if scale_match:
+        percent = int(scale_match.group(1))
+        return {
+            "action": "scale",
+            "params": {"axis": "uniform", "value": percent / 100.0},
+            "description": f"Scaled model by {percent}%.",
+        }
+
+    move_match = re.search(r"move(?:\s+the)?(?:\s+model|\s+object)?\s+(up|down|left|right|forward|backward)\s*(\d+)?", lower)
+    if move_match:
+        direction = move_match.group(1)
+        amount = int(move_match.group(2) or "1")
+        axis = "y" if direction in {"up", "down"} else "x" if direction in {"left", "right"} else "z"
+        sign = 1
+        if direction in {"down", "left", "backward"}:
+            sign = -1
+        return {
+            "action": "move",
+            "params": {"axis": axis, "value": sign * amount},
+            "description": f"Moved model {direction} by {amount} units.",
+        }
+
+    return None
+
+
+def infer_voice_intent_fallback(text: str) -> dict:
+    normalized = text.strip()
+    lower = normalized.lower()
+
+    simple_command = parse_simple_command(normalized)
+    if simple_command:
+        return {"intent": "command_fallback", "source": simple_command}
+
+    generation_match = re.search(
+        r"\b(?:make|create|generate|build|design|model|sculpt|render)\b\s*(.+)",
+        lower,
+    )
+    if generation_match:
+        prompt = generation_match.group(1).strip(" .,:;\"'`")
+        prompt = re.sub(r"^(?:a|an|the)\s+", "", prompt).strip()
+        if prompt:
+            return {"intent": "generate_blender", "prompt": prompt}
+
+    return {"intent": "command_fallback", "source": {}}
+
+
+def transcribe_audio_file(audio_path: Path) -> tuple[str, str]:
+    local_engine_error = ""
+    try:
+        model = get_faster_whisper_model()
+        segments, info = model.transcribe(str(audio_path), beam_size=1, vad_filter=True)
+        transcript = " ".join(segment.text.strip() for segment in segments if segment.text.strip()).strip()
+        if transcript:
+            language = getattr(info, "language", "unknown")
+            return transcript, f"faster_whisper:{language}"
+    except Exception as exc:
+        local_engine_error = str(exc)
+
+    try:
+        import speech_recognition as sr  # type: ignore[import-not-found]
+        recognizer = sr.Recognizer()
+        with sr.AudioFile(str(audio_path)) as source:
+            audio_data = recognizer.record(source)
+        transcript = recognizer.recognize_google(audio_data)
+        return transcript.strip(), "speech_recognition_google"
+    except Exception as exc:
+        raise RuntimeError(
+            f"audio transcription failed; local engine error: {local_engine_error or 'unknown'}; fallback error: {exc}"
+        ) from exc
+
+
+async def process_voice_text(text: str) -> dict:
+    wake_phrase = os.getenv("ARK_WAKE_PHRASE", "hello ark").strip().lower()
+    normalized_text = text.strip()
+    if normalized_text.lower().startswith(wake_phrase):
+        normalized_text = normalized_text[len(wake_phrase):].strip(" ,.:;")
+
+    # For explicit generation phrases, skip LLM intent parsing and generate directly.
+    deterministic_intent = infer_voice_intent_fallback(normalized_text)
+    if str(deterministic_intent.get("intent", "")).strip().lower() == "generate_blender":
+        prompt = str(deterministic_intent.get("prompt", normalized_text)).strip() or normalized_text
+        result = await generate_obj_from_prompt(prompt, "voice-model", source="voice_text")
+        return {
+            "transcript": text,
+            "intent": deterministic_intent,
+            "result": result,
+        }
+
+    intent_json = await query_voice_intent(normalized_text)
+    intent = str(intent_json.get("intent", "")).strip().lower()
+
+    if not intent:
+        intent_json = infer_voice_intent_fallback(normalized_text)
+        intent = str(intent_json.get("intent", "")).strip().lower()
+
+    if intent == "generate_blender":
+        prompt = str(intent_json.get("prompt", normalized_text)).strip() or normalized_text
+        result = await generate_obj_from_prompt(prompt, "voice-model", source="voice_text")
+        return {
+            "transcript": text,
+            "intent": intent_json,
+            "result": result,
+        }
+
+    if intent == "edit_unity":
+        await broadcast_unity_event({
+            "type": "edit_unity",
+            **intent_json,
+        })
+        return {
+            "transcript": text,
+            "intent": intent_json,
+            "result": {"status": "sent_to_unity"},
+        }
+
+    return {
+        "transcript": text,
+        "intent": {"intent": "command_fallback", "source": intent_json},
+        "result": parse_simple_command(normalized_text) or await process_command_text(normalized_text),
+    }
+
+
 async def process_command_text(command_text: str) -> dict:
     result = await query_local_command(command_text)
     return {
@@ -427,6 +794,7 @@ async def generate_obj_from_prompt(
         "type": "generation_started",
         "job_id": job_id,
         "prompt": user_prompt,
+        "message": "generation started",
         "source": source,
     })
 
@@ -435,6 +803,7 @@ async def generate_obj_from_prompt(
             "type": "generation_started",
             "job_id": job_id,
             "prompt": user_prompt,
+            "message": "generation started",
             "source": source,
         })
 
@@ -484,6 +853,10 @@ async def generate_obj_from_prompt(
         if not obj_path.exists() or obj_path.stat().st_size < 64:
             raise RuntimeError("obj file was not created correctly")
 
+        modular_ok, modular_message = validate_obj_modularity(obj_path)
+        if not modular_ok:
+            raise RuntimeError(modular_message)
+
         completed_at = now_iso()
         result = {
             "status": "success",
@@ -524,6 +897,61 @@ async def generate_obj_from_prompt(
         return result
 
     except Exception as e:
+        fallback_reason = str(e)
+        try:
+            fallback_script = build_modular_fallback_script(user_prompt, obj_path)
+            script_path.write_text(fallback_script, encoding="utf-8")
+            ok, exit_code, stdout_text, stderr_text, error_message = await run_blender_script(script_path)
+            if ok and obj_path.exists() and obj_path.stat().st_size >= 64:
+                modular_ok, modular_message = validate_obj_modularity(obj_path)
+                if modular_ok:
+                    completed_at = now_iso()
+                    result = {
+                        "status": "success",
+                        "job_id": job_id,
+                        "prompt": user_prompt,
+                        "obj_path": to_relative_artifact_path(obj_path),
+                        "script_path": to_relative_artifact_path(script_path),
+                        "started_at": started_at,
+                        "completed_at": completed_at,
+                        "exit_code": exit_code,
+                        "stdout_tail": stdout_text[-1200:],
+                        "stderr_tail": stderr_text[-1200:],
+                        "message": "fallback modular obj generated",
+                        "fallback_reason": fallback_reason,
+                    }
+                    generation_jobs.appendleft(result)
+                    last_generation_status = {
+                        "status": "success",
+                        "job_id": job_id,
+                        "message": "fallback modular obj generated",
+                    }
+
+                    await send_generation_event(ws, {
+                        "type": "generation_complete",
+                        "job_id": job_id,
+                        "obj_path": result["obj_path"],
+                        "script_path": result["script_path"],
+                        "message": result["message"],
+                        "source": source,
+                        "fallback_reason": fallback_reason,
+                    })
+                    await broadcast_unity_event({
+                        "type": "generation_complete",
+                        "job_id": job_id,
+                        "obj_path": result["obj_path"],
+                        "script_path": result["script_path"],
+                        "message": result["message"],
+                        "source": source,
+                        "fallback_reason": fallback_reason,
+                    }, skip_ws=ws)
+                    return result
+                fallback_reason = modular_message
+            else:
+                fallback_reason = error_message or fallback_reason
+        except Exception as fallback_error:
+            fallback_reason = f"{fallback_reason}; fallback failed: {fallback_error}"
+
         failed_at = now_iso()
         result = {
             "status": "failed",
@@ -533,25 +961,25 @@ async def generate_obj_from_prompt(
             "script_path": to_relative_artifact_path(script_path),
             "started_at": started_at,
             "completed_at": failed_at,
-            "message": str(e),
+            "message": fallback_reason,
         }
         generation_jobs.appendleft(result)
         last_generation_status = {
             "status": "failed",
             "job_id": job_id,
-            "message": str(e),
+            "message": fallback_reason,
         }
 
         await send_generation_event(ws, {
             "type": "generation_failed",
             "job_id": job_id,
-            "message": str(e),
+            "message": fallback_reason,
             "source": source,
         })
         await broadcast_unity_event({
             "type": "generation_failed",
             "job_id": job_id,
-            "message": str(e),
+            "message": fallback_reason,
             "source": source,
         }, skip_ws=ws)
         return result
@@ -626,6 +1054,49 @@ async def rest_command(body: dict):
     return {"input": prompt, "result": result}
 
 
+@app.post("/api/voice/analyze")
+async def rest_voice_analyze(body: dict):
+    text = str(body.get("text", "")).strip()
+    if not text:
+        raise HTTPException(status_code=400, detail="text is required")
+    return await process_voice_text(text)
+
+
+@app.post("/api/voice/audio")
+async def rest_voice_audio(
+    audio: UploadFile = File(...),
+    auto_process: bool = Form(True),
+):
+    if not audio.filename:
+        raise HTTPException(status_code=400, detail="audio filename is required")
+    if not is_audio_filename(audio.filename):
+        raise HTTPException(status_code=400, detail="audio must be wav, flac, aiff, aif, or aifc")
+
+    raw_bytes = await audio.read()
+    if not raw_bytes:
+        raise HTTPException(status_code=400, detail="audio file is empty")
+
+    with tempfile.NamedTemporaryFile(delete=False, suffix=Path(audio.filename).suffix or ".wav") as temp_file:
+        temp_file.write(raw_bytes)
+        temp_path = Path(temp_file.name)
+
+    try:
+        transcript, engine = await asyncio.to_thread(transcribe_audio_file, temp_path)
+        response = {
+            "transcript": transcript,
+            "engine": engine,
+            "audio_name": audio.filename,
+        }
+        if auto_process:
+            response.update(await process_voice_text(transcript))
+        return response
+    finally:
+        try:
+            temp_path.unlink(missing_ok=True)
+        except Exception:
+            pass
+
+
 @app.post("/api/generate-obj")
 async def rest_generate_obj(body: dict):
     prompt = str(body.get("prompt", "")).strip()
@@ -641,6 +1112,34 @@ async def rest_generate_obj(body: dict):
     if result.get("status") not in ["success", "script_ready"]:
         raise HTTPException(status_code=500, detail=result)
     return result
+
+
+@app.post("/api/image-to-3d/base64")
+async def create_image_to_3d_job_base64(body: dict):
+    if not image_to_3d_service:
+        raise HTTPException(status_code=500, detail="image-to-3d service unavailable")
+
+    prompt = str(body.get("prompt", "")).strip()
+    filename = str(body.get("filename", "image-model")).strip() or "image-model"
+    image_name = str(body.get("image_name", f"{filename}.png")).strip() or f"{filename}.png"
+    image_payload = str(body.get("image_base64", "")).strip()
+    if not image_payload:
+        raise HTTPException(status_code=400, detail="image_base64 is required")
+
+    try:
+        image_bytes = decode_base64_payload(image_payload)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    job = await image_to_3d_service.create_job(
+        prompt=prompt,
+        image_bytes=image_bytes,
+        filename_hint=filename,
+        original_name=image_name,
+    )
+    if job.get("status") == "failed":
+        raise HTTPException(status_code=503, detail=job.get("message", "image-to-3d service unavailable"))
+    return {"status": "accepted", "job": job}
 
 
 @app.get("/api/generation-jobs")
@@ -762,7 +1261,7 @@ async def websocket_endpoint(ws: WebSocket):
 
         while True:
             data = await ws.receive_text()
-            print(f"[ARK] Received: {data}")
+            print(f"[ARK] Received: {summarize_ws_payload(data)}")
 
             try:
                 msg = json.loads(data)
@@ -800,6 +1299,67 @@ async def websocket_endpoint(ws: WebSocket):
                     "prompt": prompt,
                     "result": result,
                 })
+
+            elif msg_type == "voice_audio":
+                audio = str(msg.get("audio_base64", "")).strip()
+                if not audio:
+                    await ws.send_json({"type": "error", "message": "audio_base64 is required"})
+                    continue
+                auto_process = bool(msg.get("auto_process", True))
+                try:
+                    audio_bytes = decode_base64_payload(str(audio))
+                except ValueError as exc:
+                    await ws.send_json({"type": "error", "message": str(exc)})
+                    continue
+
+                audio_name = str(msg.get("audio_name", "voice.wav"))
+                if not is_audio_filename(audio_name):
+                    await ws.send_json({"type": "error", "message": "audio_name must end in wav, flac, aiff, aif, or aifc"})
+                    continue
+
+                with tempfile.NamedTemporaryFile(delete=False, suffix=Path(audio_name).suffix or ".wav") as temp_file:
+                    temp_file.write(audio_bytes)
+                    temp_path = Path(temp_file.name)
+
+                try:
+                    transcript, engine = await asyncio.to_thread(transcribe_audio_file, temp_path)
+                    response = {"type": "voice_transcript", "transcript": transcript, "engine": engine}
+                    await ws.send_json(response)
+                    if auto_process:
+                        processed = await process_voice_text(transcript)
+                        await ws.send_json({"type": "voice_processed", **processed})
+                finally:
+                    try:
+                        temp_path.unlink(missing_ok=True)
+                    except Exception:
+                        pass
+
+            elif msg_type == "image_to_3d":
+                image_payload = str(msg.get("image_base64", "")).strip()
+                if not image_payload:
+                    await ws.send_json({"type": "error", "message": "image_base64 is required"})
+                    continue
+
+                image_name = str(msg.get("image_name", "input.png")).strip() or "input.png"
+                filename_hint = str(msg.get("filename", "image-model")).strip() or "image-model"
+                prompt = str(msg.get("prompt", "")).strip()
+
+                try:
+                    image_bytes = decode_base64_payload(image_payload)
+                except ValueError as exc:
+                    await ws.send_json({"type": "error", "message": str(exc)})
+                    continue
+
+                job = await image_to_3d_service.create_job(
+                    prompt=prompt,
+                    image_bytes=image_bytes,
+                    filename_hint=filename_hint,
+                    original_name=image_name,
+                )
+                if job.get("status") == "failed":
+                    await ws.send_json({"type": "image_job_failed", "job": job})
+                else:
+                    await ws.send_json({"type": "image_job_accepted", "job": job})
 
             elif msg_type == "voice_start":
                 if not voice_service:
